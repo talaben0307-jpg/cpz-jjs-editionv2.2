@@ -577,7 +577,8 @@ local BilingualDict = {
     ["Insta Seal/kill Tech"] = "Insta Seal / Kill Tech | Kỹ Thuật Phong Ấn Tức Thì",
     ["Inf Stun (Second Wind)"] = "Inf Stun | Khóa Địch Lơ Lửng Trên Không",
     ["Kinematic Orbit"] = "Kinematic Orbit | Xoay Vòng Quanh Địch",
-    ["Orbit Enabled"] = "Orbit Enabled | Bật Xoay Vòng Quanh Địch",
+    ["Orbit Enabled"] = "Orbit Enabled | Bật Xoay Tàn Ảnh Quanh Địch",
+    ["Orbit Auto M1"] = "Orbit Auto M1 | Tự Đánh M1 Khi Xoay",
     ["Orbit Speed"] = "Orbit Speed | Tốc Độ Xoay",
     ["Orbit Distance"] = "Orbit Distance | Bán Kính Xoay",
     ["Orbit Height"] = "Orbit Height | Độ Cao Khi Xoay",
@@ -3303,8 +3304,9 @@ end
 EmbeddedModules.OP = function(OPTab)
     local Settings = {
         OrbitEnabled = false,
-        OrbitSpeed = 180,
-        OrbitDistance = 7,
+        OrbitAutoM1 = false,
+        OrbitSpeed = 7200,
+        OrbitDistance = 6.5,
         OrbitHeight = 0,
         LockBehindEnabled = false,
         LockBehindDistance = 4.5,
@@ -3329,6 +3331,9 @@ EmbeddedModules.OP = function(OPTab)
 
     local State = {
         CurrentAngle = 0,
+        LockedTarget = nil,
+        WasOrbiting = false,
+        LastM1Time = 0,
         NoclipParts = {},
         LastDodgeTime = 0,
         IsDodging = false
@@ -3345,6 +3350,29 @@ EmbeddedModules.OP = function(OPTab)
         return (hum and hum.Health > 0) and hum or nil
     end
 
+    local function isTargetValidAndAlive(model)
+        if not model or not model.Parent or not model:IsDescendantOf(Workspace) then return false end
+        if model:GetAttribute("Dead") then return false end
+        if model:FindFirstChildOfClass("ForceField") then return false end
+        local hum = getAliveHumanoid(model)
+        local hrp = getHRP(model)
+        if not (hum and hrp) then return false end
+        local myChar = LocalPlayer.Character
+        local myHRP = getHRP(myChar)
+        if myHRP and (hrp.Position - myHRP.Position).Magnitude > Settings.MaxTargetRange then
+            return false
+        end
+        return true
+    end
+
+    local function restoreCameraSubject()
+        local myChar = LocalPlayer.Character
+        local myHum = myChar and myChar:FindFirstChildOfClass("Humanoid")
+        if Camera and myHum and Camera.CameraSubject ~= myHum then
+            Camera.CameraSubject = myHum
+        end
+    end
+
     local function ResetVelocity(hrp)
         if hrp and hrp.Parent then
             pcall(function()
@@ -3352,6 +3380,45 @@ EmbeddedModules.OP = function(OPTab)
                 hrp.AssemblyAngularVelocity = Vector3.zero
             end)
         end
+    end
+
+    local function fireOrbitM1(targetChar)
+        local now = os.clock()
+        if now - State.LastM1Time < 0.08 then return end
+        State.LastM1Time = now
+
+        task.spawn(function()
+            local myChar = LocalPlayer.Character
+            if not myChar then return end
+            local fired = false
+            local ms = myChar:GetAttribute("Moveset") or LocalPlayer:GetAttribute("Moveset")
+            if ms then
+                local cleanName = string.gsub(ms == "Makora" and "Mahoraga" or tostring(ms), "%s+", "")
+                local knit = ReplicatedStorage:FindFirstChild("Knit")
+                local services = knit and ((knit:FindFirstChild("Knit") and knit.Knit:FindFirstChild("Services")) or knit:FindFirstChild("Services"))
+                local svc = services and services:FindFirstChild(cleanName .. "Service")
+                local act = svc and svc:FindFirstChild("RE") and svc.RE:FindFirstChild("Activated")
+                if act then
+                    pcall(function() act:FireServer(false, targetChar) end)
+                    fired = true
+                end
+            end
+            if not fired then
+                local fallback = ReplicatedStorage:FindFirstChild("Activated", true)
+                if fallback and fallback:IsA("RemoteEvent") then
+                    pcall(function() fallback:FireServer(false) end)
+                end
+            end
+            if mouse1click then
+                pcall(mouse1click)
+            elseif VirtualInputManager and UserInputService.KeyboardEnabled then
+                pcall(function()
+                    VirtualInputManager:SendMouseButtonEvent(0, 0, 0, true, game, 1)
+                    task.wait(0.01)
+                    VirtualInputManager:SendMouseButtonEvent(0, 0, 0, false, game, 1)
+                end)
+            end
+        end)
     end
 
     local function getPlayersList()
@@ -3362,7 +3429,7 @@ EmbeddedModules.OP = function(OPTab)
         return list
     end
 
-    local function getBestTarget()
+    local function findNewClosestTarget()
         local myChar = LocalPlayer.Character
         local myHRP = getHRP(myChar)
         if not myHRP then return nil end
@@ -3373,12 +3440,8 @@ EmbeddedModules.OP = function(OPTab)
             local pName = Settings.SelectedPlayerName
             if pName and pName ~= "None" then
                 local targetPlayer = Players:FindFirstChild(pName)
-                if targetPlayer and targetPlayer.Character then
-                    local tHRP = getHRP(targetPlayer.Character)
-                    local tHum = getAliveHumanoid(targetPlayer.Character)
-                    if tHRP and tHum and (tHRP.Position - myPos).Magnitude ^ 2 <= maxRangeSq then
-                        return targetPlayer.Character
-                    end
+                if targetPlayer and targetPlayer.Character and isTargetValidAndAlive(targetPlayer.Character) then
+                    return targetPlayer.Character
                 end
             end
             return nil
@@ -3386,14 +3449,26 @@ EmbeddedModules.OP = function(OPTab)
 
         local best, shortest = nil, maxRangeSq
         for _, p in ipairs(Players:GetPlayers()) do
-            if p ~= LocalPlayer and p.Character then
+            if p ~= LocalPlayer and p.Character and isTargetValidAndAlive(p.Character) then
                 local tHRP = getHRP(p.Character)
-                local tHum = getAliveHumanoid(p.Character)
-                if tHRP and tHum and not p.Character:FindFirstChildOfClass("ForceField") then
+                local dSq = (tHRP.Position - myPos).Magnitude ^ 2
+                if dSq < shortest then
+                    shortest = dSq
+                    best = p.Character
+                end
+            end
+        end
+
+        if not best then
+            local charsFolder = Workspace:FindFirstChild("Characters") or Workspace:FindFirstChild("Live")
+            local pool = charsFolder and charsFolder:GetChildren() or Workspace:GetChildren()
+            for _, obj in ipairs(pool) do
+                if obj:IsA("Model") and obj ~= myChar and not Players:GetPlayerFromCharacter(obj) and isTargetValidAndAlive(obj) then
+                    local tHRP = getHRP(obj)
                     local dSq = (tHRP.Position - myPos).Magnitude ^ 2
                     if dSq < shortest then
                         shortest = dSq
-                        best = p.Character
+                        best = obj
                     end
                 end
             end
@@ -3401,26 +3476,55 @@ EmbeddedModules.OP = function(OPTab)
         return best
     end
 
-    track(RunService.PreSimulation:Connect(function(deltaTime)
+    local function getLockedOrClosestTarget()
+        if State.LockedTarget and isTargetValidAndAlive(State.LockedTarget) then
+            return State.LockedTarget
+        end
+        State.LockedTarget = findNewClosestTarget()
+        return State.LockedTarget
+    end
+
+    local function stepOrbitFrame(deltaTime)
         local anyActive = Settings.OrbitEnabled or Settings.LockBehindEnabled
-        if not anyActive then return end
+        if not anyActive then
+            if State.WasOrbiting then
+                State.WasOrbiting = false
+                State.LockedTarget = nil
+                restoreCameraSubject()
+                local myChar = LocalPlayer.Character
+                local myHum = myChar and myChar:FindFirstChildOfClass("Humanoid")
+                if myHum then myHum.AutoRotate = true end
+            end
+            return
+        end
+
         local myChar = LocalPlayer.Character
         local myHRP = getHRP(myChar)
         local myHum = getAliveHumanoid(myChar)
-        if not myHRP or not myHum then return end
-        local targetChar = getBestTarget()
+        if not myHRP or not myHum then
+            restoreCameraSubject()
+            return
+        end
+
+        local targetChar = getLockedOrClosestTarget()
         local tHRP = getHRP(targetChar)
         local tHum = getAliveHumanoid(targetChar)
         if not (tHRP and tHum) then
+            restoreCameraSubject()
             if not myHum.AutoRotate then myHum.AutoRotate = true end
             return
         end
-        if Settings.AutoNoclip and myChar then
+
+        State.WasOrbiting = true
+
+        if (Settings.AutoNoclip or Settings.OrbitEnabled) and myChar then
             for _, part in ipairs(myChar:GetDescendants()) do
                 if part:IsA("BasePart") and part.CanCollide then part.CanCollide = false end
             end
         end
+
         if Settings.LockBehindEnabled then
+            restoreCameraSubject()
             myHum.AutoRotate = false
             local tPos = tHRP.Position
             local tLook = Vector3.new(tHRP.CFrame.LookVector.X, 0, tHRP.CFrame.LookVector.Z)
@@ -3432,21 +3536,82 @@ EmbeddedModules.OP = function(OPTab)
             ResetVelocity(myHRP)
         elseif Settings.OrbitEnabled then
             myHum.AutoRotate = false
-            State.CurrentAngle = (State.CurrentAngle + math.rad(Settings.OrbitSpeed) * deltaTime) % (math.pi * 2)
+            if Camera and Camera.CameraSubject ~= tHum then
+                Camera.CameraSubject = tHum
+            end
+
+            local stepRad = math.rad(Settings.OrbitSpeed) * deltaTime
+            if Settings.OrbitSpeed >= 2500 then
+                stepRad = stepRad + 2.39996322972865332
+            end
+            State.CurrentAngle = (State.CurrentAngle + stepRad) % (math.pi * 2)
+
             local tPos = tHRP.Position
-            local calculatedPos = tPos + Vector3.new(math.cos(State.CurrentAngle) * Settings.OrbitDistance, Settings.OrbitHeight, math.sin(State.CurrentAngle) * Settings.OrbitDistance)
+            local calculatedPos = tPos + Vector3.new(
+                math.cos(State.CurrentAngle) * Settings.OrbitDistance,
+                Settings.OrbitHeight,
+                math.sin(State.CurrentAngle) * Settings.OrbitDistance
+            )
             myHRP.CFrame = CFrame.lookAt(calculatedPos, Vector3.new(tPos.X, calculatedPos.Y, tPos.Z))
             ResetVelocity(myHRP)
+
+            if Settings.OrbitAutoM1 then
+                fireOrbitM1(targetChar)
+            end
+        end
+    end
+
+    track(RunService.PreSimulation:Connect(stepOrbitFrame))
+    track(RunService.RenderStepped:Connect(function(dt)
+        if Settings.OrbitEnabled and Settings.OrbitSpeed >= 2500 then
+            stepOrbitFrame(dt)
         end
     end))
 
+    track(LocalPlayer.CharacterAdded:Connect(function()
+        State.LockedTarget = nil
+    end))
+
     OPTab:CreateSection("Kinematic Orbit")
-    OPTab:CreateToggle({ Name = "Orbit Enabled", CurrentValue = false, Callback = function(val) Settings.OrbitEnabled = val if val then Settings.LockBehindEnabled = false end end })
-    OPTab:CreateSlider({ Name = "Orbit Speed", Range = {30, 720}, Increment = 10, Suffix = " °/s", CurrentValue = 180, Callback = function(val) Settings.OrbitSpeed = val end })
-    OPTab:CreateSlider({ Name = "Orbit Distance", Range = {2, 25}, Increment = 0.5, Suffix = " Studs", CurrentValue = 7, Callback = function(val) Settings.OrbitDistance = val end })
+    OPTab:CreateToggle({
+        Name = "Orbit Enabled",
+        CurrentValue = false,
+        Callback = function(val)
+            Settings.OrbitEnabled = val
+            if val then
+                Settings.LockBehindEnabled = false
+                State.LockedTarget = findNewClosestTarget()
+            else
+                State.LockedTarget = nil
+                restoreCameraSubject()
+            end
+        end
+    })
+    OPTab:CreateToggle({
+        Name = "Orbit Auto M1",
+        CurrentValue = false,
+        Callback = function(val)
+            Settings.OrbitAutoM1 = val
+        end
+    })
+    OPTab:CreateSlider({ Name = "Orbit Speed", Range = {360, 25000}, Increment = 100, Suffix = " °/s", CurrentValue = 7200, Callback = function(val) Settings.OrbitSpeed = val end })
+    OPTab:CreateSlider({ Name = "Orbit Distance", Range = {2, 25}, Increment = 0.5, Suffix = " Studs", CurrentValue = 6.5, Callback = function(val) Settings.OrbitDistance = val end })
     OPTab:CreateSlider({ Name = "Orbit Height", Range = {-5, 15}, Increment = 0.5, Suffix = " Studs", CurrentValue = 0, Callback = function(val) Settings.OrbitHeight = val end })
     OPTab:CreateSection("Lock Behind (Back Hunter)")
-    OPTab:CreateToggle({ Name = "Lock Behind Enabled", CurrentValue = false, Callback = function(val) Settings.LockBehindEnabled = val if val then Settings.OrbitEnabled = false end end })
+    OPTab:CreateToggle({
+        Name = "Lock Behind Enabled",
+        CurrentValue = false,
+        Callback = function(val)
+            Settings.LockBehindEnabled = val
+            if val then
+                Settings.OrbitEnabled = false
+                restoreCameraSubject()
+                State.LockedTarget = findNewClosestTarget()
+            else
+                State.LockedTarget = nil
+            end
+        end
+    })
     OPTab:CreateSlider({ Name = "Distance Behind Target", Range = {2, 15}, Increment = 0.5, Suffix = " Studs", CurrentValue = 4.5, Callback = function(val) Settings.LockBehindDistance = val end })
     OPTab:CreateSlider({ Name = "Height Offset", Range = {-5, 10}, Increment = 0.5, Suffix = " Studs", CurrentValue = 0, Callback = function(val) Settings.LockBehindHeight = val end })
     OPTab:CreateToggle({ Name = "Predict Movement", CurrentValue = false, Callback = function(val) Settings.PredictMovement = val end })
@@ -3461,8 +3626,8 @@ EmbeddedModules.OP = function(OPTab)
     OPTab:CreateSlider({ Name = "UI Dodge Distance", Range = {4, 25}, Increment = 1, Suffix = " Studs", CurrentValue = 11, Callback = function(val) Settings.UIDodgeDistance = val end })
     OPTab:CreateSlider({ Name = "UI Dodge Cooldown", Range = {0.1, 2.0}, Increment = 0.05, Suffix = "s", CurrentValue = 0.35, Callback = function(val) Settings.UIDodgeCooldown = val end })
     OPTab:CreateSection("Targeting & Systems")
-    OPTab:CreateDropdown({ Name = "Target Mode", Options = {"Closest", "Crosshair", "Selected"}, CurrentOption = "Closest", Callback = function(val) Settings.TargetMode = type(val) == "table" and val[1] or val end })
-    local pDropdown = OPTab:CreateDropdown({ Name = "Selected Player", Options = getPlayersList(), CurrentOption = "None", Callback = function(val) Settings.SelectedPlayerName = type(val) == "table" and val[1] or val end })
+    OPTab:CreateDropdown({ Name = "Target Mode", Options = {"Closest", "Crosshair", "Selected"}, CurrentOption = "Closest", Callback = function(val) Settings.TargetMode = type(val) == "table" and val[1] or val State.LockedTarget = nil end })
+    local pDropdown = OPTab:CreateDropdown({ Name = "Selected Player", Options = getPlayersList(), CurrentOption = "None", Callback = function(val) Settings.SelectedPlayerName = type(val) == "table" and val[1] or val State.LockedTarget = nil end })
     track(Players.PlayerAdded:Connect(function() pDropdown:Refresh(getPlayersList()) end))
     track(Players.PlayerRemoving:Connect(function() pDropdown:Refresh(getPlayersList()) end))
     OPTab:CreateSlider({ Name = "Max Target Range", Range = {20, 500}, Increment = 10, Suffix = " Studs", CurrentValue = 250, Callback = function(val) Settings.MaxTargetRange = val end })
